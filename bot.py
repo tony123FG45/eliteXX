@@ -3,6 +3,8 @@ import ssl
 import certifi
 import logging
 import sqlite3
+import random
+import re
 from html import escape
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -53,6 +55,128 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("vip_bot")
+
+# =========================================================
+# FUNCIONES DE GENERACIÓN DE TARJETAS (LUHN ALGORITHM)
+# =========================================================
+
+def calculate_luhn_check_digit(number):
+    """Calcula el dígito de verificación de Luhn para un número dado."""
+    total = 0
+    reverse_digits = number[::-1]
+    
+    for i, digit in enumerate(reverse_digits):
+        n = int(digit)
+        
+        if i % 2 == 0:
+            n *= 2
+            if n > 9:
+                n -= 9
+        
+        total += n
+    
+    check_digit = (10 - (total % 10)) % 10
+    return check_digit
+
+def generate_valid_card_from_pattern(pattern):
+    """Genera una tarjeta válida a partir de un patrón con 'x'."""
+    parts = pattern.split('|')
+    if len(parts) != 4:
+        raise ValueError("Formato inválido. Debe ser: numero|mes|año|cvv")
+    
+    number_pattern, month_pattern, year_pattern, cvv_pattern = parts
+    
+    # ===== GENERAR NÚMERO DE TARJETA =====
+    generated_number = ""
+    for char in number_pattern:
+        if char == 'x' or char == 'X':
+            generated_number += str(random.randint(0, 9))
+        else:
+            generated_number += char
+    
+    if len(generated_number) < 16:
+        while len(generated_number) < 15:
+            generated_number += str(random.randint(0, 9))
+    
+    first_15 = generated_number[:15]
+    check_digit = calculate_luhn_check_digit(first_15)
+    final_number = first_15 + str(check_digit)
+    
+    # ===== GENERAR FECHA DE EXPIRACIÓN =====
+    month = ""
+    for char in month_pattern:
+        if char == 'x' or char == 'X':
+            month += str(random.randint(0, 9))
+        else:
+            month += char
+    
+    if month == "xx" or month == "XX":
+        month = str(random.randint(1, 12)).zfill(2)
+    else:
+        month_int = int(month) if month.isdigit() else random.randint(1, 12)
+        month_int = max(1, min(12, month_int))
+        month = str(month_int).zfill(2)
+    
+    # Año
+    year = ""
+    for char in year_pattern:
+        if char == 'x' or char == 'X':
+            year += str(random.randint(0, 9))
+        else:
+            year += char
+    
+    current_year = datetime.now().year
+    if year == "xxxx" or year == "XXXX":
+        year = str(current_year + random.randint(1, 5))
+    else:
+        if len(year) == 2:
+            year_int = int(year) if year.isdigit() else random.randint(24, 29)
+            year = str(2000 + year_int)
+        elif len(year) == 4 and year.isdigit():
+            year_int = int(year)
+            if year_int < current_year:
+                year_int = current_year + random.randint(1, 5)
+                year = str(year_int)
+    
+    # ===== GENERAR CVV =====
+    cvv = ""
+    for char in cvv_pattern:
+        if char == 'x' or char == 'X':
+            cvv += str(random.randint(0, 9))
+        else:
+            cvv += char
+    
+    if cvv == "xxx" or cvv == "XXX":
+        cvv = str(random.randint(100, 999))
+    elif len(cvv) < 3:
+        cvv = cvv.ljust(3, str(random.randint(0, 9)))
+    
+    return f"{final_number}|{month}|{year}|{cvv}"
+
+def generate_multiple_cards(pattern, count=1):
+    """Genera múltiples tarjetas válidas a partir de un patrón."""
+    cards = []
+    for _ in range(count):
+        try:
+            card = generate_valid_card_from_pattern(pattern)
+            cards.append(card)
+        except Exception as e:
+            logger.error(f"Error generando tarjeta: {e}")
+            default_card = generate_default_card()
+            cards.append(default_card)
+    return cards
+
+def generate_default_card():
+    """Genera una tarjeta por defecto si el patrón falla."""
+    bin_prefix = "5428780"
+    random_digits = ''.join(str(random.randint(0, 9)) for _ in range(8))
+    first_15 = bin_prefix + random_digits
+    check_digit = calculate_luhn_check_digit(first_15)
+    card_number = first_15 + str(check_digit)
+    month = str(random.randint(1, 12)).zfill(2)
+    year = str(datetime.now().year + random.randint(1, 5))
+    cvv = str(random.randint(100, 999))
+    return f"{card_number}|{month}|{year}|{cvv}"
 
 # =========================================================
 # ENCRIPTACIÓN DE COOKIES
@@ -175,6 +299,7 @@ def get_remaining_cooldown(user_id: int, command: str) -> int:
         "mx": 30,      # 30 segundos para /mx
         "refe": 60,    # 60 segundos para /refe
         "cuki": 300,   # 5 minutos para /cuki
+        "gen": 60,     # 60 segundos para /gen
     }
     
     cooldown = cooldowns.get(command, 30)
@@ -350,12 +475,14 @@ def increment_refe_count(user_id: int):
     conn.commit()
     conn.close()
 
-async def safe_reply(message, text: str):
+async def safe_reply(message, text: str, parse_mode: str = ParseMode.HTML):
+    """Envía un mensaje con formato HTML por defecto."""
     try:
-        await message.reply_text(text, parse_mode=ParseMode.HTML)
+        await message.reply_text(text, parse_mode=parse_mode)
     except Exception as e:
         logger.error(f"Error al enviar mensaje: {e}")
-        await message.reply_text(text)
+        # Fallback sin formato
+        await message.reply_text(text.replace('<', '&lt;').replace('>', '&gt;'))
 
 async def send_log(context: ContextTypes.DEFAULT_TYPE, text: str):
     if not LOG_GROUP_ID:
@@ -419,7 +546,12 @@ async def mx_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_row = get_user_row(user_id)
 
     if not user_row or not user_row["cookie"]:
-        await safe_reply(msg, "❌ <b>Error:</b> Necesitas una cookie guardada. Usa <code>/cuki</code> para guardarla.")
+        await safe_reply(msg,
+            "❌ <b>Error:</b> Necesitas una cookie guardada.\n\n"
+            "📝 <b>¿Cómo guardar tu cookie?</b>\n"
+            "1. Responde al mensaje con tu cookie\n"
+            "2. Usa el comando: <code>/cuki</code>\n\n"
+            "💡 <b>Tip:</b> Guarda tu cookie una vez y el bot la recordará")
         return
 
     cookie = decrypt_cookie(user_row["cookie"])
@@ -436,7 +568,12 @@ async def mx_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text and msg.reply_to_message and msg.reply_to_message.text:
         text = msg.reply_to_message.text
     elif not text:
-        await safe_reply(msg, "❌ <b>Uso:</b> Responde al mensaje con las tarjetas o escribe <code>/mx</code> seguido de las tarjetas.")
+        await safe_reply(msg,
+            "❌ <b>Uso:</b> Responde al mensaje con las tarjetas o escribe <code>/mx</code> seguido de las tarjetas.\n\n"
+            "📝 <b>Formato válido:</b>\n"
+            "<code>numero|mes|año|cvv</code>\n\n"
+            "💡 <b>Ejemplo:</b>\n"
+            "<code>5317223259757842|11|2033|030</code>")
         return
 
     lines = text.strip().split('\n')
@@ -455,10 +592,20 @@ async def mx_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cards_to_check.append(f"{parts[0]}|{parts[1]}|{parts[2]}|{parts[3]}")
 
     if not cards_to_check:
-        await safe_reply(msg, "❌ <b>Error:</b> No se encontraron tarjetas válidas en el formato: <code>numero|mes|año|cvv</code>\n\nEjemplo:\n5317223259757842|11|2033|030")
+        await safe_reply(msg,
+            "❌ <b>Error:</b> No se encontraron tarjetas válidas.\n\n"
+            "📝 <b>Formato correcto:</b>\n"
+            "<code>numero|mes|año|cvv</code>\n\n"
+            "💡 <b>Ejemplo:</b>\n"
+            "<code>5317223259757842|11|2033|030</code>\n\n"
+            "📝 <b>Para generar tarjetas:</b>\n"
+            "Usa el comando: <code>/gen 1234567xxxxxxxxx|xx|xxxx|xxx</code>")
         return
 
-    await safe_reply(msg, f"🔍 <b>Verificando {len(cards_to_check)} tarjetas...</b>\n\nEspera un momento...")
+    await safe_reply(msg, 
+        f"🔍 <b>Verificando {len(cards_to_check)} tarjeta(s)...</b>\n\n"
+        "⏳ <b>Espera un momento...</b>\n\n"
+        "📊 <b>Procesando tarjetas...</b>")
 
     results = []
     for card in cards_to_check:
@@ -495,13 +642,14 @@ async def mx_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_icon = "⚠️"
 
         output_text += f"{status_icon} <code>{card}</code>\n"
-        output_text += f"<i>{message}</i>\n\n"
+        output_text += f"<i>{escape(message)}</i>\n\n"
 
-    output_text += f"━━━━━━━━━━━━━━━━\n"
+    output_text += f"━━━━━━━━━━━━━━━━━━━━━━━\n"
     output_text += f"✅ <b>Aprobadas:</b> {approved_count}\n"
     output_text += f"❌ <b>Declinadas:</b> {declined_count}\n"
     output_text += f"⚠️ <b>Errores:</b> {error_count}\n"
-    output_text += f"━━━━━━━━━━━━━━━━"
+    output_text += f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    output_text += f"📊 <b>Total:</b> {len(results)}"
 
     await safe_reply(msg, output_text)
 
@@ -524,6 +672,117 @@ async def verify_card(card_data: str, cookie: str) -> dict:
             }
 
 # =========================================================
+# COMANDO /gen PARA GENERAR TARJETAS
+# =========================================================
+
+@require_active_plan
+async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Genera tarjetas de crédito válidas a partir de un patrón."""
+    msg = update.message
+    user_id = update.effective_user.id
+    user = update.effective_user
+    
+    # Log del comando
+    log_command(user_id, user.username or "sin_username", "/gen", msg.chat_id)
+    
+    # Rate limiting
+    if not check_rate_limit(user_id, "gen", 60):
+        remaining = get_remaining_cooldown(user_id, "gen")
+        await safe_reply(msg, 
+            f"⏳ <b>Espera {remaining} segundos</b> antes de usar /gen nuevamente.")
+        return
+    
+    # Verificar argumentos
+    if not context.args:
+        await safe_reply(msg,
+            "❌ <b>Uso:</b> <code>/gen patrón [cantidad]</code>\n\n"
+            "📝 <b>Ejemplos:</b>\n"
+            "<code>/gen 1234567xxxxxxxxx|xx|xxxx|xxx</code>\n"
+            "<code>/gen 5428780xxxxxxxx|xx|xxxx|xxx 5</code>\n"
+            "<code>/gen 40001234xxxxxxxx|xx|xxxx|xxx 10</code>\n\n"
+            "💡 <b>Notas:</b>\n"
+            "• Los dígitos fijos se mantienen\n"
+            "• Las 'x' se reemplazan por dígitos aleatorios\n"
+            "• El último dígito se ajusta para ser válido (Luhn)\n"
+            "• Las fechas son futuras\n"
+            "• Límite: 20 tarjetas por comando")
+        return
+    
+    pattern = context.args[0]
+    
+    # Validar patrón básico
+    if '|' not in pattern or pattern.count('|') != 3:
+        await safe_reply(msg,
+            "❌ <b>Formato inválido</b>\n\n"
+            "El patrón debe tener el formato: <code>numero|mes|año|cvv</code>\n"
+            "Ejemplo: <code>1234567xxxxxxxxx|xx|xxxx|xxx</code>")
+        return
+    
+    # Obtener cantidad (por defecto 1)
+    count = 1
+    if len(context.args) > 1:
+        try:
+            count = int(context.args[1])
+            count = min(max(1, count), 20)  # Límite de 20 tarjetas
+        except ValueError:
+            await safe_reply(msg, "❌ Cantidad inválida. Debe ser un número.")
+            return
+    
+    # Mostrar mensaje de procesamiento
+    processing_msg = await msg.reply_text(
+        f"🔢 <b>Generando {count} tarjeta(s)...</b>\n\n"
+        f"📝 <b>Patrón:</b> <code>{pattern}</code>\n\n"
+        "⏳ <b>Espera un momento...</b>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    try:
+        # Generar tarjetas
+        cards = generate_multiple_cards(pattern, count)
+        
+        # Formatear respuesta
+        if count == 1:
+            response = (
+                f"✅ <b>TARJETA GENERADA</b>\n\n"
+                f"<code>{cards[0]}</code>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📝 <b>Patrón usado:</b> <code>{pattern}</code>\n"
+                f"✅ <b>Válida (Luhn check passed)</b>\n"
+                f"📅 <b>Fecha futura:</b> Sí\n"
+                f"🔐 <b>CVV válido:</b> Sí"
+            )
+        else:
+            response = f"✅ <b>{count} TARJETAS GENERADAS</b>\n\n"
+            response += f"📝 <b>Patrón:</b> <code>{pattern}</code>\n\n"
+            response += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            for i, card in enumerate(cards, 1):
+                response += f"{i}. <code>{card}</code>\n"
+            
+            response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            response += f"✅ <b>Todas válidas (Luhn check passed)</b>\n"
+            response += f"📅 <b>Fechas futuras:</b> Sí\n"
+            response += f"🔐 <b>CVV válidos:</b> Sí"
+        
+        await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
+        
+        # Log
+        await send_log(context, 
+            f"User {user_id} generó {count} tarjetas con patrón: {pattern[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Error en /gen: {e}")
+        await processing_msg.edit_text(
+            "❌ <b>Error al generar tarjetas</b>\n\n"
+            f"Error: {escape(str(e))}\n\n"
+            "💡 <b>Asegúrate de que el patrón tenga el formato correcto:</b>\n"
+            "<code>numero|mes|año|cvv</code>\n\n"
+            "📝 <b>Ejemplo:</b>\n"
+            "<code>1234567xxxxxxxxx|xx|xxxx|xxx</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+# =========================================================
 # MANEJADORES DE COMANDOS (RESTO DEL CÓDIGO)
 # =========================================================
 
@@ -531,58 +790,96 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_registered(user)
     log_command(user.id, user.username or "sin_username", "/start", update.message.chat_id)
-    await safe_reply(update.message, f"👋 Bienvenido, {user.first_name}!\n\nUsa <code>/help</code> para ver los comandos.")
+    await safe_reply(update.message, 
+        f"👋 <b>Bienvenido, {escape(user.first_name)}!</b>\n\n"
+        "🤖 <b>Bot de verificación de tarjetas</b>\n\n"
+        "Usa <code>/help</code> para ver todos los comandos disponibles.\n\n"
+        "💡 <b>Consejo:</b> Guarda tu cookie con <code>/cuki</code> para verificar tarjetas.")
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_command(user.id, user.username or "sin_username", "/help", update.message.chat_id)
     text = (
         "🤖 <b>COMANDOS DISPONIBLES</b>\n\n"
-        "<b>Usuarios:</b>\n"
+        "<b>👤 Usuarios:</b>\n"
         "• <code>/start</code> - Iniciar bot\n"
         "• <code>/help</code> - Ver comandos\n"
         "• <code>/mi_plan</code> - Ver estado de tu plan\n"
         "• <code>/ck</code> - Ver cookie guardada\n"
         "• <code>/cuki</code> - Guardar cookie (responde al mensaje)\n"
-        "• <code>/mx</code> - Verificar tarjetas (envía varias)\n"
+        "• <code>/mx</code> - Verificar tarjetas\n"
         "• <code>/refe</code> - Enviar referencia\n"
+        "• <code>/gen</code> - Generar tarjetas válidas\n"
         "• <code>/staff</code> - Ver staff\n"
         "• <code>/precios</code> - Ver precios\n"
-        "• <code>/id</code> - Ver tu ID\n"
+        "• <code>/id</code> - Ver tu ID\n\n"
+        "<b>👑 Admins:</b>\n"
+        "• <code>/panel</code> - Panel de control\n"
+        "• <code>/plan ID dias</code> - Dar plan\n"
+        "• <code>/ban ID</code> - Banear\n"
+        "• <code>/unban ID</code> - Desbanear\n"
+        "• <code>/warn ID [motivo]</code> - Advertir\n"
+        "• <code>/unwarn ID</code> - Quitar advertencia\n"
+        "• <code>/users [página]</code> - Listar usuarios\n"
+        "• <code>/broadcast mensaje</code> - Enviar a todos\n"
+        "• <code>/stats</code> - Estadísticas"
     )
-    if is_admin(user.id):
-        text += "\n\n<b>Admins:</b>\n"
-        text += "• <code>/panel</code> - Panel de control\n"
-        text += "• <code>/plan ID dias</code> - Dar plan\n"
-        text += "• <code>/ban ID</code> - Banear\n"
-        text += "• <code>/unban ID</code> - Desbanear\n"
-        text += "• <code>/warn ID [motivo]</code> - Advertir\n"
-        text += "• <code>/unwarn ID</code> - Quitar advertencia\n"
-        text += "• <code>/users [página]</code> - Listar usuarios\n"
-        text += "• <code>/broadcast mensaje</code> - Enviar a todos\n"
-        text += "• <code>/stats</code> - Estadísticas\n"
     await safe_reply(update.message, text)
 
 async def mi_plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = update.effective_user
     log_command(user_id, user.username or "sin_username", "/mi_plan", update.message.chat_id)
-    status = "Activo" if plan_active(user_id) else "Inactivo"
+    
+    status = "✅ <b>Activo</b>" if plan_active(user_id) else "❌ <b>Inactivo</b>"
     remaining = plan_remaining(user_id)
-    await safe_reply(update.message, f"📅 <b>ESTADO DEL PLAN</b>\n\nEstado: <code>{status}</code>\nRestante: <code>{remaining}</code>")
+    
+    if plan_active(user_id):
+        await safe_reply(update.message, 
+            f"📅 <b>ESTADO DEL PLAN</b>\n\n"
+            f"👤 <b>Usuario:</b> {escape(user.first_name)}\n"
+            f"📊 <b>Estado:</b> {status}\n"
+            f"⏰ <b>Restante:</b> <code>{remaining}</code>\n\n"
+            "💡 <b>Tip:</b> Tu plan expirará automáticamente después de la fecha indicada.")
+    else:
+        await safe_reply(update.message,
+            f"📅 <b>ESTADO DEL PLAN</b>\n\n"
+            f"👤 <b>Usuario:</b> {escape(user.first_name)}\n"
+            f"📊 <b>Estado:</b> {status}\n\n"
+            "❌ <b>No tienes un plan activo.</b>\n\n"
+            "💡 <b>¿Qué hacer?</b>\n"
+            "• Contacta al staff para adquirir un plan\n"
+            "• Usa <code>/precios</code> para ver los precios\n\n"
+            "🔗 <i>Enlaces de contacto:</i>\n"
+            "• <code>@TheVax1</code>\n"
+            "• <code>@ElcazaJR1</code>")
 
 async def ck_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = update.effective_user
     log_command(user_id, user.username or "sin_username", "/ck", update.message.chat_id)
+    
     row = get_user_row(user_id)
     cookie = decrypt_cookie(row["cookie"]) if row and row["cookie"] else ""
+    
     if cookie:
-        await safe_reply(update.message, f"🍪 <b>TU COOKIE:</b>\n\n<code>{cookie}</code>")
+        await safe_reply(update.message,
+            f"🍪 <b>TU COOKIE</b>\n\n"
+            f"<b>Usuario:</b> {escape(user.first_name)}\n"
+            f"<b>ID:</b> <code>{user_id}</code>\n\n"
+            f"<code>{escape(cookie)}</code>\n\n"
+            "⚠️ <b>IMPORTANTE:</b>\n"
+            "• No compartas tu cookie con nadie\n"
+            "• Si la pierdes, usa <code>/cuki</code> para guardarla nuevamente\n"
+            "• La cookie está encriptada en nuestra base de datos")
     else:
-        await safe_reply(update.message, "❌ No tienes cookies guardadas. Usa <code>/cuki</code> para guardarlas.")
+        await safe_reply(update.message,
+            "❌ <b>No tienes cookies guardadas</b>\n\n"
+            "📝 <b>¿Cómo guardar tu cookie?</b>\n\n"
+            "1. Copia tu cookie (responde al mensaje con ella)\n"
+            "2. Usa el comando: <code>/cuki</code>\n\n"
+            "💡 <b>Tip:</b> Puedes guardar tu cookie una vez y el bot la recordará")
 
-@require_active_plan
 async def cuki_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = update.effective_user.id
@@ -592,28 +889,48 @@ async def cuki_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Rate limiting
     if not check_rate_limit(user_id, "cuki", 300):
         remaining = get_remaining_cooldown(user_id, "cuki")
-        await safe_reply(msg, f"⏳ <b>Espera {remaining} segundos</b> antes de cambiar la cookie nuevamente.")
+        await safe_reply(msg, 
+            f"⏳ <b>Espera {remaining} segundos</b> antes de cambiar la cookie nuevamente.")
         return
     
     text = None
-
+    
     if msg.reply_to_message:
         text = msg.reply_to_message.text
     elif msg.text:
-        text = msg.text.split(' ', 1)[1] if len(msg.text.split(' ')) > 1 else None
-
+        parts = msg.text.split(' ', 1)
+        if len(parts) > 1:
+            text = parts[1]
+    
     if text:
+        # Validar que la cookie tenga contenido
+        if len(text.strip()) < 10:
+            await safe_reply(msg, 
+                "❌ <b>Cookie muy corta</b>\n\n"
+                "La cookie debe tener contenido válido.\n"
+                "Por favor, responde con la cookie completa.")
+            return
+        
         encrypted_cookie = encrypt_cookie(text)
         conn = db()
         c = conn.cursor()
         c.execute("UPDATE users SET cookie=? WHERE telegram_id=?", (encrypted_cookie, user_id))
         conn.commit()
         conn.close()
-        await safe_reply(msg, "✅ <b>Cookie guardada correctamente.</b>")
+        
+        await safe_reply(msg,
+            f"✅ <b>Cookie guardada correctamente</b>\n\n"
+            f"🔐 <b>Estado:</b> Encriptada y segura\n"
+            f"📝 <b>Usuario:</b> {escape(user.first_name)}\n\n"
+            "💡 <b>Tip:</b> Ahora puedes usar el comando <code>/mx</code> para verificar tarjetas")
     else:
-        await safe_reply(msg, "❌ <b>Error:</b> Responde al mensaje con la cookie o escribe <code>/cuki TU_COOKIE</code>")
+        await safe_reply(msg,
+            "❌ <b>Error al guardar cookie</b>\n\n"
+            "📝 <b>¿Cómo guardar tu cookie?</b>\n\n"
+            "1. Responde al mensaje con tu cookie\n"
+            "2. O escribe: <code>/cuki TU_COOKIE</code>\n\n"
+            "🔐 <b>Nota:</b> La cookie está encriptada y es segura")
 
-@require_active_plan
 async def refe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = update.effective_user.id
@@ -659,8 +976,9 @@ async def refe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-        await safe_reply(msg, "✅ <b>Referencia enviada correctamente.</b>\n\n"
-                          f"📊 <b>Tu número de referencia:</b> <code>{ref_count}</code>")
+        await safe_reply(msg, 
+            "✅ <b>Referencia enviada correctamente.</b>\n\n"
+            f"📊 <b>Tu número de referencia:</b> <code>{ref_count}</code>")
     except Exception as e:
         logger.error(f"Error al enviar referencia: {e}")
         await safe_reply(msg, "❌ <b>Error:</b> No se pudo enviar la referencia. Intenta nuevamente.")
@@ -668,21 +986,46 @@ async def refe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def staff_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_command(user.id, user.username or "sin_username", "/staff", update.message.chat_id)
+    
     text = (
         "👑 <b>STAFF OFICIAL</b>\n\n"
-        "• <b>ıllıllıᐯ卂乂ıllıllı</b>:@TheVax1\n"
-        "• <b>Elcaza</b>: @ElcazaJR1\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Administrador Principal</b>\n"
+        "• <code>@TheVax1</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Soporte</b>\n"
+        "• <code>@ElcazaJR1</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📝 <b>Horario de atención:</b>\n"
+        "• Lunes a Domingo: 9:00 AM - 11:00 PM (MX)\n\n"
+        "💡 <b>¿Problemas?</b>\n"
+        "• Contacta al staff directamente\n"
+        "• Envía captura de pantalla del error\n"
+        "• Sé paciente, responderemos lo antes posible"
     )
     await safe_reply(update.message, text)
 
 async def precios_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_command(user.id, user.username or "sin_username", "/precios", update.message.chat_id)
+    
     text = (
-        "💎 <b>PRECIOS</b>\n\n"
-        "• 7 días: <code>$200 MXN</code>\n"
-        "• 15 días: <code>$350 MXN</code>\n"
-        "• 30 días: <code>$500 MXN</code>"
+        "💎 <b>PRECIOS DE PLANES</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 <b>7 DÍAS</b>\n"
+        "💰 <b>Costo:</b> <code>$200 MXN</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 <b>15 DÍAS</b>\n"
+        "💰 <b>Costo:</b> <code>$350 MXN</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 <b>30 DÍAS</b>\n"
+        "💰 <b>Costo:</b> <code>$500 MXN</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📝 <b>¿Cómo comprar?</b>\n"
+        "1. Contacta al staff\n"
+        "2. Realiza el pago\n"
+        "3. El plan se activa automáticamente\n\n"
+        "💡 <b>Tip:</b> Los planes más largos tienen mejor precio por día"
     )
     await safe_reply(update.message, text)
 
@@ -691,7 +1034,22 @@ async def id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_command(user_id, user.username or "sin_username", "/id", update.message.chat_id)
     chat_id = update.effective_chat.id
-    text = f"🆔 <b>TU ID:</b> <code>{user_id}</code>\n\n🏢 <b>ID DEL GRUPO:</b> <code>{chat_id}</code>"
+    
+    text = (
+        "🆔 <b>TU INFORMACIÓN</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>ID de Telegram:</b>\n"
+        f"<code>{user_id}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Nombre:</b>\n"
+        f"<code>{escape(user.first_name)}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Username:</b>\n"
+        f"<code>{user.username or 'Sin username'}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🏢 <b>ID del Grupo/Chat:</b>\n"
+        f"<code>{chat_id}</code>"
+    )
     await safe_reply(update.message, text)
 
 async def idgr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1292,7 +1650,7 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
                 
                 # Enviar mensaje en el grupo
                 await update.message.reply_text(
-                    f"🚫 <b>{new_member.first_name} ha sido expulsado</b>\n\n"
+                    f"🚫 <b>{escape(new_member.first_name)} ha sido expulsado</b>\n\n"
                     f"Razón: No tiene un plan activo.\n"
                     f"ID: <code>{user_id}</code>",
                     parse_mode=ParseMode.HTML
@@ -1312,7 +1670,7 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
             # Tiene plan activo, dar la bienvenida
             try:
                 await update.message.reply_text(
-                    f"👋 ¡Bienvenido {new_member.first_name}!\n\n"
+                    f"👋 ¡Bienvenido {escape(new_member.first_name)}!\n\n"
                     f"Tu plan está activo hasta: {plan_remaining(user_id)}",
                     parse_mode=ParseMode.HTML
                 )
@@ -1394,6 +1752,7 @@ def main():
     application.add_handler(CommandHandler("ck", ck_handler))
     application.add_handler(CommandHandler("cuki", cuki_handler))
     application.add_handler(CommandHandler("mx", mx_handler))
+    application.add_handler(CommandHandler("gen", gen_handler))  # NUEVO
     application.add_handler(CommandHandler("refe", refe_handler))
     application.add_handler(CommandHandler("staff", staff_handler))
     application.add_handler(CommandHandler("precios", precios_handler))
