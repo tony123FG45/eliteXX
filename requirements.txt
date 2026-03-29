@@ -2,3 +2,5 @@ certifi
 aiohttp
 requests
 python-telegram-bot==20.7
+python-telegram-bot==20.7
+FROM python:3.11-slim
