@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==20.7
 aiohttp
 requests
 certifi
+cryptography
