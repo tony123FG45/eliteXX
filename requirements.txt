@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]==20.7
-aiohttp
-requests
-certifi
-cryptography
+aiohttp==3.9.3
+requests==2.31.0
+cryptography==42.0.5
+certifi==2024.2.2
