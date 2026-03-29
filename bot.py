@@ -3,7 +3,6 @@ import ssl
 import certifi
 import logging
 import sqlite3
-from python:3.11-slim
 from html import escape
 import asyncio
 from datetime import datetime, timedelta, timezone
