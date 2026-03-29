@@ -595,8 +595,7 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(check_plans, interval=timedelta(minutes=1), first=0)
 
-    # Configurar webhook
-    application.set_webhook(url='https://tu-dominio.com/webhook')
+
 
     logger.info("Bot iniciado correctamente...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
