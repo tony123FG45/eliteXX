@@ -179,6 +179,111 @@ def generate_default_card():
     return f"{card_number}|{month}|{year}|{cvv}"
 
 # =========================================================
+# EXTRAPOLADOR DE TARJETAS (ExtrapoladorCC)
+# =========================================================
+
+class ExtrapoladorCC:
+    """Clase para extrapolar números de tarjeta a partir de un patrón."""
+    
+    @staticmethod
+    def extrapolar_desde_patron(patron: str, cantidad: int = 10) -> list:
+        """
+        Extrapola números de tarjeta a partir de un patrón.
+        
+        Args:
+            patron: Patrón con dígitos conocidos y 'x' para desconocidos
+                   Ejemplo: "123456xxxxxx1234"
+            cantidad: Número de tarjetas a generar
+        
+        Returns:
+            Lista de números de tarjeta extrapolados
+        """
+        if not patron or 'x' not in patron.lower():
+            return [patron] * cantidad if patron else []
+        
+        resultados = []
+        for _ in range(cantidad):
+            numero = ""
+            for char in patron:
+                if char.lower() == 'x':
+                    numero += str(random.randint(0, 9))
+                else:
+                    numero += char
+            
+            # Asegurar que tenga 16 dígitos
+            if len(numero) < 16:
+                numero = numero.ljust(16, str(random.randint(0, 9)))
+            elif len(numero) > 16:
+                numero = numero[:16]
+            
+            # Aplicar algoritmo de Luhn para hacerlo válido
+            if len(numero) == 16:
+                primera_15 = numero[:15]
+                digito_verificacion = calculate_luhn_check_digit(primera_15)
+                numero = primera_15 + str(digito_verificacion)
+            
+            resultados.append(numero)
+        
+        return resultados
+    
+    @staticmethod
+    def generar_fecha_expiracion() -> tuple:
+        """Genera una fecha de expiración aleatoria futura."""
+        mes = random.randint(1, 12)
+        año = datetime.now().year + random.randint(1, 5)
+        return f"{mes:02d}", str(año)
+    
+    @staticmethod
+    def generar_cvv() -> str:
+        """Genera un CVV aleatorio."""
+        return str(random.randint(100, 999))
+
+# =========================================================
+# BIN LOOKUP API
+# =========================================================
+
+async def get_bin_info(bin_number: str) -> dict:
+    """
+    Obtiene información del BIN desde la API de binlist.net.
+    
+    Args:
+        bin_number: Los primeros 6-8 dígitos de la tarjeta
+    
+    Returns:
+        Diccionario con información del BIN
+    """
+    if len(bin_number) < 6:
+        return {"error": "BIN demasiado corto"}
+    
+    bin_to_check = bin_number[:8]  # Usar hasta 8 dígitos para mejor precisión
+    url = f"https://lookup.binlist.net/{bin_to_check}"
+    
+    headers = {
+        "Accept-Version": "3",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return {
+                        "success": True,
+                        "scheme": data.get("scheme", "Desconocido"),
+                        "type": data.get("type", "Desconocido"),
+                        "brand": data.get("brand", "Desconocido"),
+                        "prepaid": data.get("prepaid", False),
+                        "country": data.get("country", {}).get("name", "Desconocido"),
+                        "bank": data.get("bank", {}).get("name", "Desconocido"),
+                        "emoji": data.get("country", {}).get("emoji", "🏳️")
+                    }
+                else:
+                    return {"success": False, "error": f"API error: {response.status}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# =========================================================
 # ENCRIPTACIÓN DE COOKIES
 # =========================================================
 
@@ -299,7 +404,7 @@ def get_remaining_cooldown(user_id: int, command: str) -> int:
         "mx": 30,      # 30 segundos para /mx
         "refe": 60,    # 60 segundos para /refe
         "cuki": 300,   # 5 minutos para /cuki
-        "gen": 60,     # 60 segundos para /gen
+        "gen": 0,      # 0 segundos para /gen (sin cooldown según solicitud)
     }
     
     cooldown = cooldowns.get(command, 30)
@@ -672,7 +777,7 @@ async def verify_card(card_data: str, cookie: str) -> dict:
             }
 
 # =========================================================
-# COMANDO /gen PARA GENERAR TARJETAS
+# COMANDO /gen MEJORADO (SIN COOLDOWN, AUTO-COMPLETE, 10 TARJETAS)
 # =========================================================
 
 @require_active_plan
@@ -685,45 +790,59 @@ async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Log del comando
     log_command(user_id, user.username or "sin_username", "/gen", msg.chat_id)
     
-    # Rate limiting
-    if not check_rate_limit(user_id, "gen", 60):
-        remaining = get_remaining_cooldown(user_id, "gen")
-        await safe_reply(msg, 
-            f"⏳ <b>Espera {remaining} segundos</b> antes de usar /gen nuevamente.")
-        return
+    # NO HAY RATE LIMITING PARA /gen (eliminado según solicitud)
+    # check_rate_limit se omite intencionalmente
     
     # Verificar argumentos
     if not context.args:
         await safe_reply(msg,
             "❌ <b>Uso:</b> <code>/gen patrón [cantidad]</code>\n\n"
             "📝 <b>Ejemplos:</b>\n"
+            "<code>/gen 1234567</code> (auto-completa a 16 dígitos)\n"
             "<code>/gen 1234567xxxxxxxxx|xx|xxxx|xxx</code>\n"
-            "<code>/gen 5428780xxxxxxxx|xx|xxxx|xxx 5</code>\n"
-            "<code>/gen 40001234xxxxxxxx|xx|xxxx|xxx 10</code>\n\n"
+            "<code>/gen 5428780 5</code> (5 tarjetas)\n"
+            "<code>/gen 40001234 10</code> (10 tarjetas)\n\n"
             "💡 <b>Notas:</b>\n"
-            "• Los dígitos fijos se mantienen\n"
+            "• Si solo pones números, se auto-completa a formato completo\n"
             "• Las 'x' se reemplazan por dígitos aleatorios\n"
             "• El último dígito se ajusta para ser válido (Luhn)\n"
-            "• Las fechas son futuras\n"
-            "• Límite: 20 tarjetas por comando")
+            "• Por defecto genera 10 tarjetas diferentes\n"
+            "• Límite: 50 tarjetas por comando")
         return
     
-    pattern = context.args[0]
+    input_pattern = context.args[0]
+    
+    # AUTO-COMPLETAR PATRÓN SI ES NECESARIO
+    # Si el patrón no tiene '|', asumimos que es solo el número
+    if '|' not in input_pattern:
+        # Es solo un número o patrón de número
+        number_part = input_pattern
+        
+        # Si tiene menos de 16 caracteres, completar con 'x'
+        if len(number_part) < 16:
+            number_part = number_part.ljust(16, 'x')
+        elif len(number_part) > 16:
+            number_part = number_part[:16]
+        
+        # Crear patrón completo con fechas y CVV aleatorios
+        pattern = f"{number_part}|xx|xxxx|xxx"
+    else:
+        pattern = input_pattern
     
     # Validar patrón básico
-    if '|' not in pattern or pattern.count('|') != 3:
+    if pattern.count('|') != 3:
         await safe_reply(msg,
             "❌ <b>Formato inválido</b>\n\n"
             "El patrón debe tener el formato: <code>numero|mes|año|cvv</code>\n"
             "Ejemplo: <code>1234567xxxxxxxxx|xx|xxxx|xxx</code>")
         return
     
-    # Obtener cantidad (por defecto 1)
-    count = 1
+    # Obtener cantidad (por defecto 10 según solicitud)
+    count = 10  # Cambiado de 1 a 10 por defecto
     if len(context.args) > 1:
         try:
             count = int(context.args[1])
-            count = min(max(1, count), 20)  # Límite de 20 tarjetas
+            count = min(max(1, count), 50)  # Límite aumentado a 50
         except ValueError:
             await safe_reply(msg, "❌ Cantidad inválida. Debe ser un número.")
             return
@@ -731,7 +850,8 @@ async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mostrar mensaje de procesamiento
     processing_msg = await msg.reply_text(
         f"🔢 <b>Generando {count} tarjeta(s)...</b>\n\n"
-        f"📝 <b>Patrón:</b> <code>{pattern}</code>\n\n"
+        f"📝 <b>Patrón:</b> <code>{pattern}</code>\n"
+        f"📊 <b>Cantidad:</b> {count}\n\n"
         "⏳ <b>Espera un momento...</b>",
         parse_mode=ParseMode.HTML
     )
@@ -740,29 +860,44 @@ async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Generar tarjetas
         cards = generate_multiple_cards(pattern, count)
         
+        # Obtener información BIN para la primera tarjeta
+        bin_info = None
+        if cards:
+            first_card_number = cards[0].split('|')[0]
+            bin_number = first_card_number[:6]
+            bin_info = await get_bin_info(bin_number)
+        
         # Formatear respuesta
-        if count == 1:
-            response = (
-                f"✅ <b>TARJETA GENERADA</b>\n\n"
-                f"<code>{cards[0]}</code>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📝 <b>Patrón usado:</b> <code>{pattern}</code>\n"
-                f"✅ <b>Válida (Luhn check passed)</b>\n"
-                f"📅 <b>Fecha futura:</b> Sí\n"
-                f"🔐 <b>CVV válido:</b> Sí"
-            )
-        else:
-            response = f"✅ <b>{count} TARJETAS GENERADAS</b>\n\n"
-            response += f"📝 <b>Patrón:</b> <code>{pattern}</code>\n\n"
-            response += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
-            for i, card in enumerate(cards, 1):
+        response = f"✅ <b>{count} TARJETAS GENERADAS</b>\n\n"
+        
+        # Mostrar información BIN si está disponible
+        if bin_info and bin_info.get("success"):
+            response += f"🏦 <b>INFORMACIÓN BIN:</b>\n"
+            response += f"• <b>BIN:</b> <code>{bin_number}</code>\n"
+            response += f"• <b>Esquema:</b> {bin_info.get('scheme', 'N/A')}\n"
+            response += f"• <b>Tipo:</b> {bin_info.get('type', 'N/A')}\n"
+            response += f"• <b>Marca:</b> {bin_info.get('brand', 'N/A')}\n"
+            response += f"• <b>País:</b> {bin_info.get('emoji', '')} {bin_info.get('country', 'N/A')}\n"
+            response += f"• <b>Banco:</b> {bin_info.get('bank', 'N/A')}\n"
+            response += f"• <b>Prepago:</b> {'Sí' if bin_info.get('prepaid') else 'No'}\n\n"
+        
+        response += f"📝 <b>Patrón usado:</b> <code>{pattern}</code>\n\n"
+        response += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # Mostrar todas las tarjetas
+        for i, card in enumerate(cards, 1):
+            card_parts = card.split('|')
+            if len(card_parts) == 4:
+                numero, mes, año, cvv = card_parts
+                response += f"{i}. <code>{numero}|{mes}|{año}|{cvv}</code>\n"
+            else:
                 response += f"{i}. <code>{card}</code>\n"
-            
-            response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            response += f"✅ <b>Todas válidas (Luhn check passed)</b>\n"
-            response += f"📅 <b>Fechas futuras:</b> Sí\n"
-            response += f"🔐 <b>CVV válidos:</b> Sí"
+        
+        response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        response += f"✅ <b>Todas válidas (Luhn check passed)</b>\n"
+        response += f"📅 <b>Fechas futuras:</b> Sí\n"
+        response += f"🔐 <b>CVV válidos:</b> Sí\n"
+        response += f"🔢 <b>Total generadas:</b> {count}"
         
         await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
         
@@ -777,8 +912,138 @@ async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Error: {escape(str(e))}\n\n"
             "💡 <b>Asegúrate de que el patrón tenga el formato correcto:</b>\n"
             "<code>numero|mes|año|cvv</code>\n\n"
-            "📝 <b>Ejemplo:</b>\n"
-            "<code>1234567xxxxxxxxx|xx|xxxx|xxx</code>",
+            "📝 <b>Ejemplo simple:</b>\n"
+            "<code>/gen 123456</code> (auto-completa el resto)",
+            parse_mode=ParseMode.HTML
+        )
+
+# =========================================================
+# NUEVO COMANDO: /extrapolar
+# =========================================================
+
+@require_active_plan
+async def extrapolar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extrapola números de tarjeta a partir de un patrón."""
+    msg = update.message
+    user_id = update.effective_user.id
+    user = update.effective_user
+    
+    # Log del comando
+    log_command(user_id, user.username or "sin_username", "/extrapolar", msg.chat_id)
+    
+    # NO HAY RATE LIMITING PARA /extrapolar
+    
+    if not context.args:
+        await safe_reply(msg,
+            "🔢 <b>EXTRAPOLACIÓN DE TARJETAS</b>\n\n"
+            "📝 <b>Uso:</b> <code>/extrapolar patrón [cantidad]</code>\n\n"
+            "💡 <b>Ejemplos:</b>\n"
+            "<code>/extrapolar 123456xxxxxx1234</code>\n"
+            "<code>/extrapolar 5428780xxxxxxx 20</code>\n"
+            "<code>/extrapolar 40001234xxxx5678 5</code>\n\n"
+            "📋 <b>Formato del patrón:</b>\n"
+            "• Usa dígitos fijos para las posiciones conocidas\n"
+            "• Usa 'x' para las posiciones desconocidas\n"
+            "• Ejemplo: <code>123456xx9012xx56</code>\n\n"
+            "⚡ <b>Características:</b>\n"
+            "• Genera números válidos (algoritmo de Luhn)\n"
+            "• Auto-completa a 16 dígitos si es necesario\n"
+            "• Por defecto genera 15 tarjetas\n"
+            "• Límite: 100 tarjetas por comando")
+        return
+    
+    pattern = context.args[0]
+    
+    # Obtener cantidad (por defecto 15)
+    count = 15
+    if len(context.args) > 1:
+        try:
+            count = int(context.args[1])
+            count = min(max(1, count), 100)  # Límite de 100
+        except ValueError:
+            await safe_reply(msg, "❌ Cantidad inválida. Debe ser un número.")
+            return
+    
+    # Mostrar mensaje de procesamiento
+    processing_msg = await msg.reply_text(
+        f"🔮 <b>Extrapolando {count} tarjeta(s)...</b>\n\n"
+        f"📝 <b>Patrón:</b> <code>{pattern}</code>\n"
+        f"📊 <b>Cantidad:</b> {count}\n\n"
+        "⏳ <b>Procesando extrapolación...</b>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    try:
+        # Usar ExtrapoladorCC para generar números
+        extrapolador = ExtrapoladorCC()
+        numeros_tarjeta = extrapolador.extrapolar_desde_patron(pattern, count)
+        
+        if not numeros_tarjeta:
+            await processing_msg.edit_text(
+                "❌ <b>Error en el patrón</b>\n\n"
+                "El patrón debe contener al menos una 'x' para extrapolar.\n"
+                "Ejemplo: <code>123456xxxxxx1234</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Generar fechas y CVVs para cada tarjeta
+        tarjetas_completas = []
+        for numero in numeros_tarjeta:
+            mes, año = extrapolador.generar_fecha_expiracion()
+            cvv = extrapolador.generar_cvv()
+            tarjeta_completa = f"{numero}|{mes}|{año}|{cvv}"
+            tarjetas_completas.append(tarjeta_completa)
+        
+        # Obtener información BIN para la primera tarjeta
+        bin_info = None
+        if numeros_tarjeta:
+            bin_number = numeros_tarjeta[0][:6]
+            bin_info = await get_bin_info(bin_number)
+        
+        # Formatear respuesta
+        response = f"🔮 <b>EXTRAPOLACIÓN COMPLETADA</b>\n\n"
+        response += f"📝 <b>Patrón original:</b> <code>{pattern}</code>\n"
+        response += f"📊 <b>Tarjetas generadas:</b> {count}\n\n"
+        
+        # Mostrar información BIN si está disponible
+        if bin_info and bin_info.get("success"):
+            response += f"🏦 <b>INFORMACIÓN BIN:</b>\n"
+            response += f"• <b>BIN:</b> <code>{bin_number}</code>\n"
+            response += f"• <b>Esquema:</b> {bin_info.get('scheme', 'N/A')}\n"
+            response += f"• <b>Tipo:</b> {bin_info.get('type', 'N/A')}\n"
+            if bin_info.get('brand'):
+                response += f"• <b>Marca:</b> {bin_info.get('brand')}\n"
+            response += f"• <b>País:</b> {bin_info.get('emoji', '')} {bin_info.get('country', 'N/A')}\n"
+            if bin_info.get('bank'):
+                response += f"• <b>Banco:</b> {bin_info.get('bank')}\n"
+            response += f"• <b>Prepago:</b> {'Sí' if bin_info.get('prepaid') else 'No'}\n\n"
+        
+        response += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # Mostrar todas las tarjetas
+        for i, tarjeta in enumerate(tarjetas_completas, 1):
+            response += f"{i}. <code>{tarjeta}</code>\n"
+        
+        response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        response += f"✅ <b>Todas válidas (Luhn check passed)</b>\n"
+        response += f"📅 <b>Fechas futuras:</b> Sí\n"
+        response += f"🔐 <b>CVV válidos:</b> Sí\n"
+        response += f"🔢 <b>Total extrapoladas:</b> {count}"
+        
+        await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
+        
+        # Log
+        await send_log(context, 
+            f"User {user_id} extrapoló {count} tarjetas con patrón: {pattern[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Error en /extrapolar: {e}")
+        await processing_msg.edit_text(
+            "❌ <b>Error al extrapolar tarjetas</b>\n\n"
+            f"Error: {escape(str(e))}\n\n"
+            "💡 <b>Asegúrate de que el patrón tenga el formato correcto:</b>\n"
+            "Ejemplo: <code>123456xxxxxx1234</code>",
             parse_mode=ParseMode.HTML
         )
 
@@ -810,6 +1075,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/mx</code> - Verificar tarjetas\n"
         "• <code>/refe</code> - Enviar referencia\n"
         "• <code>/gen</code> - Generar tarjetas válidas\n"
+        "• <code>/extrapolar</code> - Extrapolar tarjetas desde patrón\n"  # NUEVO
         "• <code>/staff</code> - Ver staff\n"
         "• <code>/precios</code> - Ver precios\n"
         "• <code>/id</code> - Ver tu ID\n\n"
@@ -1752,7 +2018,8 @@ def main():
     application.add_handler(CommandHandler("ck", ck_handler))
     application.add_handler(CommandHandler("cuki", cuki_handler))
     application.add_handler(CommandHandler("mx", mx_handler))
-    application.add_handler(CommandHandler("gen", gen_handler))  # NUEVO
+    application.add_handler(CommandHandler("gen", gen_handler))
+    application.add_handler(CommandHandler("extrapolar", extrapolar_handler))  # NUEVO
     application.add_handler(CommandHandler("refe", refe_handler))
     application.add_handler(CommandHandler("staff", staff_handler))
     application.add_handler(CommandHandler("precios", precios_handler))
