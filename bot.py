@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from telegram import Update, ChatPermissions, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters, JobQueue
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters, JobQueue, ConversationHandler
 import requests
 import aiohttp
 from functools import lru_cache
@@ -39,6 +39,9 @@ DEFAULT_REFE_TEXT = (
 MX_TZ = timezone(timedelta(hours=-6))
 DB = "bot.db"
 API_URL = "https://leviatan-chk.site/amazon/leviatan"
+
+# Estados para ConversationHandler
+BIN_INPUT, QUANTITY_INPUT = range(2)
 
 # Configuración SSL
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -179,64 +182,101 @@ def generate_default_card():
     return f"{card_number}|{month}|{year}|{cvv}"
 
 # =========================================================
-# EXTRAPOLADOR DE TARJETAS (ExtrapoladorCC)
+# EXTRAPOLADOR DE BIN (NUEVO)
 # =========================================================
 
-class ExtrapoladorCC:
-    """Clase para extrapolar números de tarjeta a partir de un patrón."""
+def extract_bin_from_input(user_input: str) -> tuple:
+    """
+    Extrae el BIN y el patrón de la entrada del usuario.
     
-    @staticmethod
-    def extrapolar_desde_patron(patron: str, cantidad: int = 10) -> list:
-        """
-        Extrapola números de tarjeta a partir de un patrón.
-        
-        Args:
-            patron: Patrón con dígitos conocidos y 'x' para desconocidos
-                   Ejemplo: "123456xxxxxx1234"
-            cantidad: Número de tarjetas a generar
-        
-        Returns:
-            Lista de números de tarjeta extrapolados
-        """
-        if not patron or 'x' not in patron.lower():
-            return [patron] * cantidad if patron else []
-        
-        resultados = []
-        for _ in range(cantidad):
-            numero = ""
-            for char in patron:
-                if char.lower() == 'x':
-                    numero += str(random.randint(0, 9))
-                else:
-                    numero += char
-            
-            # Asegurar que tenga 16 dígitos
-            if len(numero) < 16:
-                numero = numero.ljust(16, str(random.randint(0, 9)))
-            elif len(numero) > 16:
-                numero = numero[:16]
-            
-            # Aplicar algoritmo de Luhn para hacerlo válido
-            if len(numero) == 16:
-                primera_15 = numero[:15]
-                digito_verificacion = calculate_luhn_check_digit(primera_15)
-                numero = primera_15 + str(digito_verificacion)
-            
-            resultados.append(numero)
-        
-        return resultados
+    Args:
+        user_input: Entrada del usuario (BIN, tarjeta completa, o patrón)
     
-    @staticmethod
-    def generar_fecha_expiracion() -> tuple:
-        """Genera una fecha de expiración aleatoria futura."""
-        mes = random.randint(1, 12)
-        año = datetime.now().year + random.randint(1, 5)
-        return f"{mes:02d}", str(año)
+    Returns:
+        tuple: (bin_str, pattern, is_full_card)
+    """
+    user_input = user_input.strip()
     
-    @staticmethod
-    def generar_cvv() -> str:
-        """Genera un CVV aleatorio."""
-        return str(random.randint(100, 999))
+    # Caso 1: Solo dígitos (6-10 dígitos) - solo BIN
+    if re.match(r'^\d{6,10}$', user_input):
+        bin_str = user_input
+        # Crear patrón con el BIN fijo y el resto como x
+        pattern = bin_str.ljust(16, 'x') + "|xx|xxxx|xxx"
+        return bin_str, pattern, False
+    
+    # Caso 2: Formato con pipe (numero|mes|año|cvv)
+    if '|' in user_input:
+        parts = user_input.split('|')
+        if len(parts) == 4:
+            number_part = parts[0]
+            # Extraer BIN (primeros 6-10 dígitos fijos)
+            # Encontrar dónde terminan los dígitos fijos
+            bin_end = 0
+            for i, char in enumerate(number_part):
+                if char.lower() == 'x' and i >= 6:  # Mínimo 6 dígitos para BIN
+                    bin_end = i
+                    break
+                elif i == len(number_part) - 1:
+                    bin_end = len(number_part)
+            
+            if bin_end < 6:
+                bin_end = 6  # Mínimo 6 dígitos para BIN
+            
+            bin_str = number_part[:bin_end].replace('x', '').replace('X', '')
+            if len(bin_str) < 6:
+                # Si no hay suficientes dígitos fijos, usar los primeros 6
+                bin_str = number_part[:6].replace('x', '0').replace('X', '0')
+            
+            return bin_str, user_input, True
+    
+    # Caso 3: Tarjeta completa sin pipe (16 dígitos)
+    if re.match(r'^\d{16}$', user_input):
+        bin_str = user_input[:6]
+        pattern = f"{user_input[:6]}{'x'*10}|xx|xxxx|xxx"
+        return bin_str, pattern, True
+    
+    # Caso por defecto: tratar como patrón
+    bin_str = user_input[:6].replace('x', '0').replace('X', '0')
+    return bin_str, user_input, False
+
+def generate_cards_from_bin(bin_str: str, pattern: str, count: int) -> list:
+    """
+    Genera tarjetas válidas a partir de un BIN y patrón.
+    
+    Args:
+        bin_str: BIN fijo (primeros dígitos)
+        pattern: Patrón completo
+        count: Número de tarjetas a generar
+    
+    Returns:
+        list: Lista de tarjetas generadas
+    """
+    cards = []
+    
+    for _ in range(count):
+        try:
+            # Generar tarjeta desde el patrón
+            card = generate_valid_card_from_pattern(pattern)
+            
+            # Asegurar que el BIN se mantenga fijo
+            card_parts = card.split('|')
+            card_number = card_parts[0]
+            
+            # Reemplazar los primeros dígitos con el BIN
+            if len(bin_str) <= len(card_number):
+                # Mantener el BIN y regenerar el dígito de verificación
+                new_number = bin_str + card_number[len(bin_str):-1]  # Excluir último dígito
+                check_digit = calculate_luhn_check_digit(new_number)
+                final_number = new_number + str(check_digit)
+                card_parts[0] = final_number
+            
+            cards.append('|'.join(card_parts))
+        except Exception as e:
+            logger.error(f"Error generando tarjeta desde BIN: {e}")
+            # Generar tarjeta por defecto
+            cards.append(generate_default_card())
+    
+    return cards
 
 # =========================================================
 # BIN LOOKUP API
@@ -405,6 +445,7 @@ def get_remaining_cooldown(user_id: int, command: str) -> int:
         "refe": 60,    # 60 segundos para /refe
         "cuki": 300,   # 5 minutos para /cuki
         "gen": 0,      # 0 segundos para /gen (sin cooldown según solicitud)
+        "extrapolar": 0,  # 0 segundos para /extrapolar
     }
     
     cooldown = cooldowns.get(command, 30)
@@ -918,12 +959,12 @@ async def gen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # =========================================================
-# NUEVO COMANDO: /extrapolar
+# NUEVO COMANDO: /extrapolar (CONVERSACIÓN)
 # =========================================================
 
 @require_active_plan
-async def extrapolar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Extrapola números de tarjeta a partir de un patrón."""
+async def extrapolar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el proceso de extrapolación de BIN."""
     msg = update.message
     user_id = update.effective_user.id
     user = update.effective_user
@@ -933,119 +974,145 @@ async def extrapolar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # NO HAY RATE LIMITING PARA /extrapolar
     
-    if not context.args:
+    await safe_reply(msg,
+        "🔢 <b>EXTRAPOLAR BIN</b>\n\n"
+        "El BIN son los primeros 6-10 dígitos de una tarjeta. Identifican el banco y la red.\n\n"
+        "El extrapolador toma tu BIN, lo congela y genera variantes en los dígitos de cuenta.\n\n"
+        "📝 <b>Envía tu BIN en uno de estos formatos:</b>\n"
+        "▸ Solo dígitos (6-10): <code>52884391</code>\n"
+        "▸ Pipe completo: <code>528843916075xxxx|xx|20xx|xxx</code>\n"
+        "▸ Tarjeta completa: <code>511842042952|04|26|123</code>\n\n"
+        "Las 'x' son posiciones variables, los dígitos son fijos.")
+    
+    return BIN_INPUT
+
+async def extrapolar_bin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa la entrada del BIN."""
+    msg = update.message
+    user_input = msg.text.strip()
+    
+    # Extraer BIN y patrón de la entrada
+    try:
+        bin_str, pattern, is_full_card = extract_bin_from_input(user_input)
+        
+        if len(bin_str) < 6:
+            await safe_reply(msg, "❌ <b>BIN demasiado corto.</b> Necesita al menos 6 dígitos.")
+            return BIN_INPUT
+        
+        # Guardar en contexto
+        context.user_data['extrapolar_bin'] = bin_str
+        context.user_data['extrapolar_pattern'] = pattern
+        context.user_data['extrapolar_is_full'] = is_full_card
+        
+        # Obtener información del BIN
+        bin_info = await get_bin_info(bin_str)
+        
+        # Mostrar información y preguntar cantidad
+        response = f"✅ <b>BIN detectado:</b> <code>{bin_str}</code>\n"
+        
+        if bin_info.get("success"):
+            response += f"🔴 <b>Red:</b> {bin_info.get('scheme', 'Desconocido')}\n"
+            response += f"🎯 <b>Modo:</b> cerca primero\n\n"
+        else:
+            response += "🔴 <b>Red:</b> Desconocida\n"
+            response += "🎯 <b>Modo:</b> cerca primero\n\n"
+        
+        response += "🔢 <b>¿Cuántos BINs extrapolados quieres?</b>\n\n"
+        response += "Responde con un número entre 1 y 50:"
+        
+        await safe_reply(msg, response)
+        return QUANTITY_INPUT
+        
+    except Exception as e:
+        logger.error(f"Error procesando BIN: {e}")
         await safe_reply(msg,
-            "🔢 <b>EXTRAPOLACIÓN DE TARJETAS</b>\n\n"
-            "📝 <b>Uso:</b> <code>/extrapolar patrón [cantidad]</code>\n\n"
-            "💡 <b>Ejemplos:</b>\n"
-            "<code>/extrapolar 123456xxxxxx1234</code>\n"
-            "<code>/extrapolar 5428780xxxxxxx 20</code>\n"
-            "<code>/extrapolar 40001234xxxx5678 5</code>\n\n"
-            "📋 <b>Formato del patrón:</b>\n"
-            "• Usa dígitos fijos para las posiciones conocidas\n"
-            "• Usa 'x' para las posiciones desconocidas\n"
-            "• Ejemplo: <code>123456xx9012xx56</code>\n\n"
-            "⚡ <b>Características:</b>\n"
-            "• Genera números válidos (algoritmo de Luhn)\n"
-            "• Auto-completa a 16 dígitos si es necesario\n"
-            "• Por defecto genera 15 tarjetas\n"
-            "• Límite: 100 tarjetas por comando")
-        return
-    
-    pattern = context.args[0]
-    
-    # Obtener cantidad (por defecto 15)
-    count = 15
-    if len(context.args) > 1:
-        try:
-            count = int(context.args[1])
-            count = min(max(1, count), 100)  # Límite de 100
-        except ValueError:
-            await safe_reply(msg, "❌ Cantidad inválida. Debe ser un número.")
-            return
-    
-    # Mostrar mensaje de procesamiento
-    processing_msg = await msg.reply_text(
-        f"🔮 <b>Extrapolando {count} tarjeta(s)...</b>\n\n"
-        f"📝 <b>Patrón:</b> <code>{pattern}</code>\n"
-        f"📊 <b>Cantidad:</b> {count}\n\n"
-        "⏳ <b>Procesando extrapolación...</b>",
-        parse_mode=ParseMode.HTML
-    )
+            "❌ <b>Error procesando el BIN.</b>\n\n"
+            "Asegúrate de usar uno de estos formatos:\n"
+            "• <code>52884391</code> (6-10 dígitos)\n"
+            "• <code>511842042952|04|26|123</code> (tarjeta completa)\n"
+            "• <code>528843916075xxxx|xx|20xx|xxx</code> (patrón con x)")
+        return BIN_INPUT
+
+async def extrapolar_quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa la cantidad de tarjetas a generar."""
+    msg = update.message
     
     try:
-        # Usar ExtrapoladorCC para generar números
-        extrapolador = ExtrapoladorCC()
-        numeros_tarjeta = extrapolador.extrapolar_desde_patron(pattern, count)
+        quantity = int(msg.text.strip())
         
-        if not numeros_tarjeta:
-            await processing_msg.edit_text(
-                "❌ <b>Error en el patrón</b>\n\n"
-                "El patrón debe contener al menos una 'x' para extrapolar.\n"
-                "Ejemplo: <code>123456xxxxxx1234</code>",
-                parse_mode=ParseMode.HTML
-            )
-            return
+        if quantity < 1 or quantity > 50:
+            await safe_reply(msg, "❌ <b>Cantidad inválida.</b> Debe ser entre 1 y 50.")
+            return QUANTITY_INPUT
         
-        # Generar fechas y CVVs para cada tarjeta
-        tarjetas_completas = []
-        for numero in numeros_tarjeta:
-            mes, año = extrapolador.generar_fecha_expiracion()
-            cvv = extrapolador.generar_cvv()
-            tarjeta_completa = f"{numero}|{mes}|{año}|{cvv}"
-            tarjetas_completas.append(tarjeta_completa)
+        # Obtener datos del contexto
+        bin_str = context.user_data.get('extrapolar_bin')
+        pattern = context.user_data.get('extrapolar_pattern')
         
-        # Obtener información BIN para la primera tarjeta
-        bin_info = None
-        if numeros_tarjeta:
-            bin_number = numeros_tarjeta[0][:6]
-            bin_info = await get_bin_info(bin_number)
+        if not bin_str or not pattern:
+            await safe_reply(msg, "❌ <b>Error:</b> No se encontraron datos del BIN.")
+            return ConversationHandler.END
+        
+        await safe_reply(msg, f"✅ <b>{quantity} BINs extrapolados</b>")
+        
+        # Generar tarjetas
+        processing_msg = await msg.reply_text(
+            f"🔢 <b>Extrapolando {quantity} tarjetas...</b>\n\n"
+            f"BIN fijo: <code>{bin_str}</code>\n\n"
+            "⏳ <b>Espera un momento...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Generar tarjetas
+        cards = generate_cards_from_bin(bin_str, pattern, quantity)
+        
+        # Obtener información BIN actualizada
+        bin_info = await get_bin_info(bin_str)
         
         # Formatear respuesta
-        response = f"🔮 <b>EXTRAPOLACIÓN COMPLETADA</b>\n\n"
-        response += f"📝 <b>Patrón original:</b> <code>{pattern}</code>\n"
-        response += f"📊 <b>Tarjetas generadas:</b> {count}\n\n"
+        response = f"✅ <b>{quantity} BINs EXTRAPOLADOS</b>\n\n"
         
-        # Mostrar información BIN si está disponible
-        if bin_info and bin_info.get("success"):
-            response += f"🏦 <b>INFORMACIÓN BIN:</b>\n"
-            response += f"• <b>BIN:</b> <code>{bin_number}</code>\n"
-            response += f"• <b>Esquema:</b> {bin_info.get('scheme', 'N/A')}\n"
-            response += f"• <b>Tipo:</b> {bin_info.get('type', 'N/A')}\n"
-            if bin_info.get('brand'):
-                response += f"• <b>Marca:</b> {bin_info.get('brand')}\n"
-            response += f"• <b>País:</b> {bin_info.get('emoji', '')} {bin_info.get('country', 'N/A')}\n"
-            if bin_info.get('bank'):
-                response += f"• <b>Banco:</b> {bin_info.get('bank')}\n"
-            response += f"• <b>Prepago:</b> {'Sí' if bin_info.get('prepaid') else 'No'}\n\n"
+        if bin_info.get("success"):
+            response += f"🔴 <b>Red:</b> {bin_info.get('scheme', 'Desconocido')}\n"
+            response += f"🎯 <b>Modo:</b> cerca primero\n\n"
+        else:
+            response += "🔴 <b>Red:</b> Desconocida\n"
+            response += "🎯 <b>Modo:</b> cerca primero\n\n"
         
+        response += f"🏦 <b>BIN fijo:</b> <code>{bin_str}</code>\n\n"
         response += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        response += "<b>Copia los que necesites 👇</b>\n\n"
         
         # Mostrar todas las tarjetas
-        for i, tarjeta in enumerate(tarjetas_completas, 1):
-            response += f"{i}. <code>{tarjeta}</code>\n"
+        for i, card in enumerate(cards, 1):
+            response += f"• <code>{card}</code>\n"
         
         response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         response += f"✅ <b>Todas válidas (Luhn check passed)</b>\n"
-        response += f"📅 <b>Fechas futuras:</b> Sí\n"
-        response += f"🔐 <b>CVV válidos:</b> Sí\n"
-        response += f"🔢 <b>Total extrapoladas:</b> {count}"
+        response += f"🔢 <b>Total extrapoladas:</b> {quantity}"
         
         await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
         
         # Log
         await send_log(context, 
-            f"User {user_id} extrapoló {count} tarjetas con patrón: {pattern[:50]}...")
+            f"User {update.effective_user.id} extrapoló {quantity} tarjetas desde BIN: {bin_str}")
         
+        # Limpiar contexto
+        context.user_data.clear()
+        
+    except ValueError:
+        await safe_reply(msg, "❌ <b>Por favor, responde con un número.</b>")
+        return QUANTITY_INPUT
     except Exception as e:
-        logger.error(f"Error en /extrapolar: {e}")
-        await processing_msg.edit_text(
-            "❌ <b>Error al extrapolar tarjetas</b>\n\n"
-            f"Error: {escape(str(e))}\n\n"
-            "💡 <b>Asegúrate de que el patrón tenga el formato correcto:</b>\n"
-            "Ejemplo: <code>123456xxxxxx1234</code>",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"Error en extrapolación: {e}")
+        await safe_reply(msg, f"❌ <b>Error al extrapolar:</b> {str(e)}")
+    
+    return ConversationHandler.END
+
+async def extrapolar_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela el proceso de extrapolación."""
+    await safe_reply(update.message, "❌ <b>Extrapolación cancelada.</b>")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # =========================================================
 # MANEJADORES DE COMANDOS (RESTO DEL CÓDIGO)
@@ -1075,7 +1142,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/mx</code> - Verificar tarjetas\n"
         "• <code>/refe</code> - Enviar referencia\n"
         "• <code>/gen</code> - Generar tarjetas válidas\n"
-        "• <code>/extrapolar</code> - Extrapolar tarjetas desde patrón\n"  # NUEVO
+        "• <code>/extrapolar</code> - Extrapolar BIN (generar variantes)\n"  # NUEVO
         "• <code>/staff</code> - Ver staff\n"
         "• <code>/precios</code> - Ver precios\n"
         "• <code>/id</code> - Ver tu ID\n\n"
@@ -1796,8 +1863,7 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎉 <b>¡SE TE HA ASIGNADO UN PLAN!</b>\n\n"
                 f"📅 <b>Duración:</b> {days} días\n"
                 f"⏰ <b>Expira:</b> {end_date.strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"Ahora puedes usar todos los comandos del bot."
-            )
+                f"Ahora puedes usar todos los comandos del bot.")
         except Exception as e:
             logger.warning(f"No se pudo notificar al usuario {target_id}: {e}")
         
@@ -1837,8 +1903,7 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id,
                 "🚫 <b>HAS SIDO BANEADO DEL SISTEMA</b>\n\n"
                 "Ya no podrás usar los comandos del bot.\n"
-                "Contacta al staff si crees que es un error."
-            )
+                "Contacta al staff si crees que es un error.")
         except:
             pass
         
@@ -1880,8 +1945,7 @@ async def warn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id,
                 f"⚠️ <b>HAS RECIBIDO UNA ADVERTENCIA</b>\n\n"
                 f"<b>Motivo:</b> {reason}\n\n"
-                f"Si acumulas muchas advertencias podrías ser baneado."
-            )
+                f"Si acumulas muchas advertencias podrías ser baneado.")
         except Exception as e:
             logger.warning(f"No se pudo notificar al usuario {target_id}: {e}")
         
@@ -1927,8 +1991,7 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
                 await send_log(
                     context,
                     f"🚫 Usuario {user_id} (@{new_member.username or 'sin_username'}) "
-                    f"expulsado del grupo por falta de plan activo"
-                )
+                    f"expulsado del grupo por falta de plan activo")
                 
             except Exception as e:
                 logger.error(f"Error al expulsar usuario {user_id}: {e}")
@@ -1965,8 +2028,7 @@ async def check_plans(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     user_id,
                     "⚠️ <b>TU PLAN EXPIRA MAÑANA</b>\n\n"
-                    "Renueva tu plan para evitar la expulsión del grupo."
-                )
+                    "Renueva tu plan para evitar la expulsión del grupo.")
                 c.execute("UPDATE plans SET last_day_warn_sent=1 WHERE telegram_id=?", (user_id,))
                 conn.commit()
             except Exception as e:
@@ -1988,8 +2050,7 @@ async def check_plans(context: ContextTypes.DEFAULT_TYPE):
                         user_id,
                         "🚫 <b>TU PLAN HA EXPIRADO</b>\n\n"
                         "Has sido expulsado del grupo principal.\n"
-                        "Renueva tu plan para volver a unirte."
-                    )
+                        "Renueva tu plan para volver a unirte.")
                 except:
                     pass
                 
@@ -2019,7 +2080,6 @@ def main():
     application.add_handler(CommandHandler("cuki", cuki_handler))
     application.add_handler(CommandHandler("mx", mx_handler))
     application.add_handler(CommandHandler("gen", gen_handler))
-    application.add_handler(CommandHandler("extrapolar", extrapolar_handler))  # NUEVO
     application.add_handler(CommandHandler("refe", refe_handler))
     application.add_handler(CommandHandler("staff", staff_handler))
     application.add_handler(CommandHandler("precios", precios_handler))
@@ -2038,6 +2098,17 @@ def main():
     application.add_handler(CommandHandler("plan", plan_cmd))
     application.add_handler(CommandHandler("ban", ban_cmd))
     application.add_handler(CommandHandler("warn", warn_cmd))
+    
+    # Handler para extrapolar (ConversationHandler)
+    extrapolar_conv = ConversationHandler(
+        entry_points=[CommandHandler("extrapolar", extrapolar_start)],
+        states={
+            BIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, extrapolar_bin_input)],
+            QUANTITY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, extrapolar_quantity_input)],
+        },
+        fallbacks=[CommandHandler("cancel", extrapolar_cancel)],
+    )
+    application.add_handler(extrapolar_conv)
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(users_callback, pattern="^users_"))
